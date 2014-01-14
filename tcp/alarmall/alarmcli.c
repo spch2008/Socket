@@ -10,12 +10,17 @@ int main(int argc, char *argv[])
     struct addrinfo hint, *result;
     int res, sfd;
     char buf[20];
+    
+    if (argc != 2) {
+        printf("usage: <port> \n");
+        exit(0);
+    }
 
     memset(&hint, 0, sizeof(hint));
     hint.ai_family   = AF_INET;
     hint.ai_socktype = SOCK_STREAM;
 
-    res = getaddrinfo("127.0.0.1", "6666", &hint, &result);
+    res = getaddrinfo("127.0.0.1", argv[1], &hint, &result);
     if (res == -1) {
         perror("error : cannot get socket address!\n");
         exit(1);
@@ -37,9 +42,9 @@ int main(int argc, char *argv[])
     write(sfd, buf, strlen(buf));
     printf("write < %s > to server\n", buf);
 
-    memset(buf, 0, 20);
-    read(sfd, buf, sizeof(buf));
-    printf("read < %s > from server\n", buf);
+    //memset(buf, 0, 20);
+    //read(sfd, buf, sizeof(buf));
+    //printf("read < %s > from server\n", buf);
 
     return 0;
 }

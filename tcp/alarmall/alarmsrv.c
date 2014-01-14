@@ -1,49 +1,97 @@
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
-#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
-#include <errno.h>
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+
+#define MAX_WORKER 4
+#define MAX_EVENTS 10
+#define BUF_SIZE   50
 
 static int create_and_bind(char *port);
 static int make_socket_non_binding(int sfd);
+static int process_work_process(int sfd);
 
 
-#define MAX_EVENTS 64
-#define BUF_SIZE   20
-#define MAX_WORKER 20
+int
+main(int argc, char *argv[])
+{
+    int sfd, res, i;
+    pid_t pid;
+
+    if (argc != 2) {
+        printf("usage : <port>\n");
+        exit(0);
+    }
+    
+    sfd = create_and_bind(argv[1]);
+    if (sfd == -1) {
+        perror("ERROR : create_and_bind\n");
+        exit(1);
+    }  
+      
+    res = make_socket_non_binding(sfd);
+    if (res == -1) {
+        perror("ERROR : make_sokcet_non_binding\n");
+        exit(1);
+    }   
+       
+    res = listen(sfd, SOMAXCONN);
+    if (res == -1) {
+        perror("ERROR : listen\n");
+        exit(1);
+    }
+    
+    for ( i = 0; i < MAX_WORKER; i++) {
+        if ((pid = fork()) < 0) {
+            perror("ERROR : fork\n");
+            exit(1);
+            
+        } else if (pid == 0) {
+            process_work_process(sfd);
+            
+        } else {
+            printf("worker process started, pid = %d\n", pid);
+        }
+    }
+    
+    while (waitpid(-1, NULL, 0)) ;
+    
+    return 0;
+}
 
 static int
-create_and_bind(char *port) {
+create_and_bind(char *port)
+{
     struct addrinfo hint, *result;
     int res, sfd;
-  
     
     memset(&hint, 0, sizeof(struct addrinfo));
     hint.ai_family   = AF_INET;
     hint.ai_socktype = SOCK_STREAM;
-    hint.ai_flags    = AI_PASSIVE;
     
     res = getaddrinfo(NULL, port, &hint, &result);
     if (res == -1) {
-        perror("error : can not get address info\n");
-        exit(1);
+        perror("ERROR : getaddrinfo\n");
+        return -1;
     }
     
     sfd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (sfd == -1) {
-        perror("error : can not get socket descriptor!\n");
-        exit(1);
+        perror("ERROR : socket\n");
+        return -1;
     }
     
     res = bind(sfd, result->ai_addr, result->ai_addrlen);
     if (res == -1) {
-        perror("error : can not bind the socket!\n");
-        exit(1);
+        perror("ERROR : bind\n");
+        return -1;
     }
     
     freeaddrinfo(result);
@@ -52,163 +100,124 @@ create_and_bind(char *port) {
 }
 
 
-static int
+static int 
 make_socket_non_binding(int sfd)
 {
-    int flags, res;
+    int flags;
     
     flags = fcntl(sfd, F_GETFL);
     if (flags == -1) {
-        perror("error : cannot get socket flags!\n");
-        exit(1);
+        perror("ERROR : fcntl F_GETFL\n");
+        return -1;
     }
     
     flags |= O_NONBLOCK;
-    res    = fcntl(sfd, F_SETFL, flags);
-    if (res == -1) {
-        perror("error : cannot set socket flags!\n");
-        exit(1);
+    flags = fcntl(sfd, F_SETFL, flags);
+    if (flags == -1) {
+        perror("ERROR : fcntl F_SETFL\n");
+        return -1;
     }
     
     return 0;
 }
 
-int
-main(int argc, char *argv[])
+
+static int
+process_work_process(int sfd)
 {
-    int sfd, res, epoll, cnt, i, sd;
+    int res, fd, efd, nfds, i, addrlen;
     struct epoll_event event, events[MAX_EVENTS];
-    pid_t pid;
+    struct sockaddr addr;
+    char buf[BUF_SIZE];
     
     
-    sfd = create_and_bind("6666");
-    if (sfd == -1) {
-        perror("error : cannot create socket!\n");
-        exit(1);
+    /* param is ignored by kernel, but must be bigger than zero */
+    efd = epoll_create(1);
+    if (efd == -1) {
+        perror("ERROR : epoll_create\n");
+        return -1;
     }
     
-    res = make_socket_non_binding(sfd);
-    if (res == -1) {
-        perror("error : connot set flags!\n");
-        exit(1);
-    }
-    
-    res = listen(sfd, SOMAXCONN);
-    if (res == -1) {
-        perror("error : cannot listen!\n");
-        exit(1);
-    }
-    
-    epoll = epoll_create(1);
-    if (epoll == -1) {
-        perror("error : cannot create epoll!\n");
-        exit(1);
-    }
-    
-    event.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+    memset(&event, 0, sizeof(struct epoll_event));
+    event.events |= EPOLLIN;
     event.data.fd = sfd;
-    res = epoll_ctl(epoll, EPOLL_CTL_ADD, sfd, &event);
+    
+    /* add listening sfd */
+    res = epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event);
     if (res == -1) {
-        perror("error : can not add event to epoll!\n");
-        exit(1);
+        perror("ERROR : epoll_ctl EPOLL_CTL_ADD\n");
+        return -1;
     }
     
-    
-    for (i = 0; i < MAX_WORKER; i++) {
-        if ((pid = fork()) < 0) {
-            perror("error\n");
-            
-        } else if (pid == 0) {
-            while (1) {
-                cnt = epoll_wait(epoll, events, MAX_EVENTS, -1);
+    for ( ; ; ) {
+        nfds = epoll_wait(efd, events, MAX_EVENTS, -1);
         
-                for (i = 0; i < cnt; i++) {
-            
-                    if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP)
-                        || !(events[i].events & EPOLLIN))
-                    {
-                        perror("error : socket fd error!\n");
-                        close(events[i].data.fd);
-                        continue;
-            
-                    } else if (events[i].data.fd == sfd) {
+        for ( i = 0; i < nfds; i++) {
+            if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP)) {
+                close(events[i].data.fd);
+                printf("socket error, fd = %d\n", events[i].data.fd);
+                continue;
                 
-                        while (1) { 
-                            struct sockaddr client_addr;
-                            int addrlen = sizeof(struct sockaddr);
+            } else if (events[i].data.fd == sfd) {
+                printf("process wake up, pid = %d\n", getpid());
+                
+                while (1) {
+                    addrlen = sizeof(struct sockaddr);
+                    fd = accept(sfd, &addr, &addrlen);
+                    if (fd == -1) {
+                        if (errno == EAGAIN) 
+                            break;
+                        else
+                            continue;
+                    }
                     
-                            sd = accept(sfd, &client_addr, &addrlen);
-                            if (sd == -1) {
+                    printf("accepted, pid = %d\n", getpid());
                     
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                    if (errno == EAGAIN) {
-                                        perror("\n jing qun\n\n");
-                                    }
-                                    break;
+                    res = make_socket_non_binding(fd);
+                    if (res == -1) {
+                        perror("ERROR : make_non_binding fd");
+                        exit(1);
+                    }
                         
-                                } else {
-                                    perror("error : cannot accept new socket!\n");
-                                    continue;
-                                }
-                        
-                            } 
-                    
-                            res = make_socket_non_binding(sd);
-                            if (res == -1) {
-                                perror("error : cannot set flags!\n");
-                                exit(1);
-                            }
-                    
-                            event.data.fd = sd;
-                            event.events  = EPOLLET | EPOLLIN;
-                            res = epoll_ctl(epoll, EPOLL_CTL_ADD, sd, &event);
-                            if (res == -1) {
-                                perror("error : cannot add to epoll!\n");
-                                exit(1);
-                            }
-                        }  
-                
-                    } else {
-                        int cnt, active;
-                        char buf[BUF_SIZE];
-                        
-                       active = 1;
-                        while (1) {
-                
-                            cnt = read(events[i].data.fd,  buf, BUF_SIZE);
-                            if (cnt == -1) {
-                                if (errno == EAGAIN) {
-                                    break;
-                                }
-                        
-                                printf("error : read error, error code = %d\n", errno);
-                                exit(1);
-                
-                            } else if (cnt == 0) {
-                                close(events[i].data.fd);
-                                active = 0;
-                                perror("client closed the connect\n");
-                                break;
-                            } 
-                
-                            printf("receive client data : %s\n", buf);
-                        }
-                        
-                        if (active) {
-                            memset(buf, 0, BUF_SIZE);
-                            strcpy(buf, "Hello Client!");
-                            write(events[i].data.fd, buf, strlen(buf));
-                            printf("send < Hello Client > to client\n");
-                            
-                        }
+                    event.data.fd = fd;
+                    event.events |= EPOLLIN;
+                    res = epoll_ctl(efd, EPOLL_CTL_ADD, fd, &event);
+                    if (res == -1) {
+                        perror("ERROR : epoll_ctl\n");
+                        exit(1);
                     }
                 }
+                
+            } else {
+                while (1) {
+                    memset(buf, 0, BUF_SIZE); 
+                     
+                    res = read(events[i].data.fd, buf, BUF_SIZE);
+                    if (res == -1) {
+                        if (errno == EAGAIN) {
+                            break;
+                        } else {
+                            perror("ERROR : read\n");
+                            exit(1);
+                        }
+
+                    } else if (res == 0) {
+                        printf("\nclient closed the socket\n");
+                        close(events[i].data.fd);
+                        break;
+                        
+                    } else {
+                        //printf("%s", buf);
+                        //fflush(stdout);
+                        write(STDOUT_FILENO, buf, res);
+                    }
+                  
+                }
+            
             }
         }
     }
     
-    while (waitpid(-1, NULL, 0));
-    close(sfd);
-    
     return 0;
 }
+
